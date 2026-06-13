@@ -31,10 +31,20 @@ data class ChatRequest(
 )
 
 @Serializable
-data class ChatResponse(val choices: List<Choice>)
+data class ChatResponse(
+    val choices: List<Choice>,
+    val usage: Usage? = null
+)
 
 @Serializable
 data class Choice(val message: ChatMessage)
+
+@Serializable
+data class Usage(
+    val prompt_tokens: Int = 0,
+    val completion_tokens: Int = 0,
+    val total_tokens: Int = 0
+)
 
 @Serializable
 data class ThinkingConfig(val type: String)
@@ -45,30 +55,41 @@ val client = OkHttpClient.Builder()
 
 fun getApiKey(): String = System.getenv("DEEPSEEK_API_KEY").orEmpty()
 
-inline fun <reified T> buildRequest(requestData: T): Request {
+inline fun <reified T> buildRequest(requestData: T, url: String = URL, apiKey: String = getApiKey()): Request {
     val requestBody = json.encodeToString(requestData)
         .toRequestBody("application/json; charset=utf-8".toMediaType())
 
     return Request.Builder()
-        .url(URL)
+        .url(url)
         .post(requestBody)
-        .addHeader("Authorization", "Bearer ${getApiKey()}")
+        .addHeader("Authorization", "Bearer $apiKey")
         .build()
 }
 
 fun fetchResponse(requestData: ChatRequest): String {
+    val response = fetchResponseWithUsage(requestData)
+    return response?.choices?.firstOrNull()?.message?.content ?: "Ошибка при получении ответа"
+}
+
+fun fetchResponseWithUsage(requestData: ChatRequest): ChatResponse? {
     val request = buildRequest(requestData)
 
-    client.newCall(request).execute().use { response ->
-        val responseBody = response.body?.string()
+    return try {
+        client.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string()
 
-        if (!response.isSuccessful) {
-            return "Ошибка\n код: ${response.code}\n Тело ответа: $responseBody"
+            if (!response.isSuccessful) {
+                println("Ошибка\n код: ${response.code}\n Тело ответа: $responseBody")
+                null
+            } else if (responseBody.isNullOrBlank()) {
+                println("Ошибка: Пустой ответ от сервера")
+                null
+            } else {
+                json.decodeFromString<ChatResponse>(responseBody)
+            }
         }
-
-        return responseBody.takeIf { !it.isNullOrBlank() }?.let { body ->
-            val parsedResponse = json.decodeFromString<ChatResponse>(body)
-            parsedResponse.choices.firstOrNull()?.message?.content.orEmpty()
-        }.orEmpty()
+    } catch (e: Exception) {
+        println("Ошибка при выполнении запроса: ${e.message}")
+        null
     }
 }
