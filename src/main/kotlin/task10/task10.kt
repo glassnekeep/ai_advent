@@ -46,10 +46,15 @@ class AdvancedAgent(
             updateFacts(userInput)
         }
 
-        // 2. Добавляем ввод пользователя в историю
+        // 2. Пред-обработка для Branching (Автоматическое определение ветки)
+        if (currentStrategy == Strategy.BRANCHING) {
+            autoDetectBranch(userInput)
+        }
+
+        // 3. Добавляем ввод пользователя в историю
         history.add(ChatMessage(role = "user", content = userInput))
 
-        // 3. Формируем контекст согласно стратегии
+        // 4. Формируем контекст согласно стратегии
         val messagesToSend = mutableListOf<ChatMessage>()
         
         // Системный промпт + факты (если нужны)
@@ -68,7 +73,7 @@ class AdvancedAgent(
         }
         messagesToSend.addAll(relevantHistory)
 
-        // 4. Запрос
+        // 5. Запрос
         val request = ChatRequest(model = model, messages = messagesToSend)
         val response = fetchResponseWithUsage(request)
 
@@ -85,6 +90,43 @@ class AdvancedAgent(
             
             println("\nАгент: $content")
             printStats(usage)
+        }
+    }
+
+    private fun autoDetectBranch(userInput: String) {
+        println("🔍 [Overhead] Определение ветки контекста...")
+        val branchList = branches.keys.joinToString(", ")
+        val classifyPrompt = """
+            Тебе даны названия текущих веток диалога: $branchList
+            Текущая ветка: $currentBranchName
+            
+            Пользователь написал: "$userInput"
+            
+            Твоя задача — определить, к какой из существующих веток относится этот вопрос, или нужно создать новую.
+            Если вопрос относится к одной из существующих веток, верни ТОЛЬКО её название.
+            Если вопрос открывает новую тему, не относящуюся к существующим, верни ТОЛЬКО слово "NEW:название_ветки" (коротко на английском, без пробелов).
+            Если не уверен, верни название текущей ветки.
+            
+            Ответ должен содержать только название ветки или команду NEW.
+        """.trimIndent()
+
+        val request = ChatRequest(
+            model = model,
+            messages = listOf(ChatMessage(role = "user", content = classifyPrompt))
+        )
+        val response = fetchResponseWithUsage(request)
+        if (response != null) {
+            val decision = response.choices.firstOrNull()?.message?.content?.trim() ?: currentBranchName
+            totalOverheadTokens += response.usage?.total_tokens ?: 0
+
+            if (decision.startsWith("NEW:")) {
+                val newBranchName = decision.substringAfter("NEW:").take(20).replace(" ", "_")
+                createBranch(newBranchName)
+            } else if (branches.containsKey(decision)) {
+                if (decision != currentBranchName) {
+                    switchBranch(decision)
+                }
+            }
         }
     }
 
@@ -146,9 +188,13 @@ class AdvancedAgent(
         println("   Ветка: $currentBranchName")
         println("   Prompt (всего): $totalPromptTokens")
         println("   Completion (всего): $totalCompletionTokens")
-        println("   Overhead (факты): $totalOverheadTokens")
+        println("   Overhead (факты/ветки): $totalOverheadTokens")
         println("   СУММА: ${totalPromptTokens + totalCompletionTokens + totalOverheadTokens}")
         println("--------------------------")
+    }
+
+    fun getStatusLine(): String {
+        return "[$currentStrategy | Branch: $currentBranchName]"
     }
 }
 
@@ -156,17 +202,31 @@ fun task10() {
     println("=== Задание 10: Разные стратегии управления контекстом ===")
     val agent = AdvancedAgent()
 
-    println("\nДоступные команды:")
+    println("\nВыберите начальную стратегию:")
+    println("1. Sliding Window (Скользящее окно)")
+    println("2. Sticky Facts (Липкие факты)")
+    println("3. Branching (Автоматическое ветвление)")
+    
+    while (true) {
+        print("Ваш выбор (1-3): ")
+        val choice = readlnOrNull()?.trim()
+        when (choice) {
+            "1" -> { agent.setStrategy(Strategy.SLIDING_WINDOW); break }
+            "2" -> { agent.setStrategy(Strategy.STICKY_FACTS); break }
+            "3" -> { agent.setStrategy(Strategy.BRANCHING); break }
+            else -> println("Пожалуйста, введите число от 1 до 3.")
+        }
+    }
+
+    println("\nДоступные команды в процессе диалога:")
     println("/strategy [window|facts|branch] - сменить стратегию")
     println("/window [n] - задать размер окна")
     println("/facts - показать накопленные факты")
-    println("/branch new [name] - создать ветку")
-    println("/branch switch [name] - переключить ветку")
-    println("/branch list - список веток")
+    println("/branch list - список веток (для автоматического режима)")
     println("/exit - выход")
 
     while (true) {
-        print("\n[${Strategy.values()}] Вы: ")
+        print("\n${agent.getStatusLine()} Вы: ")
         val input = readlnOrNull()?.trim() ?: break
         if (input.isEmpty()) continue
 
