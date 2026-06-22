@@ -22,6 +22,12 @@ data class TaskState(
     val updatedAtMillis: Long
 )
 
+data class LifecycleDecision(
+    val allowed: Boolean,
+    val state: TaskState,
+    val message: String? = null
+)
+
 class WorkingMemoryTaskStateStore(private val memoryStore: MarkdownMemoryStore = MarkdownMemoryStore()) {
     fun load(): TaskState? {
         val section = extractTaskStateSection(memoryStore.load().working) ?: return null
@@ -150,6 +156,60 @@ class TaskStateMachine(
         return state
     }
 
+    fun handleUserRequest(userInput: String): LifecycleDecision {
+        val current = current()
+        if (current == null || current.phase == TaskPhase.DONE) {
+            return LifecycleDecision(
+                allowed = true,
+                state = start(makeTitle(userInput)),
+                message = "Начинаю новую задачу с этапа PLANNING."
+            )
+        }
+
+        val desiredPhase = inferDesiredPhase(userInput)
+        if (desiredPhase == null || desiredPhase == current.phase) {
+            return LifecycleDecision(allowed = true, state = current)
+        }
+
+        if (!isAllowedTransition(current.phase, desiredPhase)) {
+            return LifecycleDecision(
+                allowed = false,
+                state = current,
+                message = invalidTransitionMessage(current.phase, desiredPhase)
+            )
+        }
+
+        if (current.phase == TaskPhase.PLANNING && desiredPhase == TaskPhase.EXECUTION && !isPlanApproval(userInput)) {
+            return LifecycleDecision(
+                allowed = false,
+                state = current,
+                message = "Я не могу перейти к реализации до утверждения плана. Сейчас этап PLANNING: сначала нужно согласовать план и критерии готовности."
+            )
+        }
+
+        if (current.phase == TaskPhase.VALIDATION && desiredPhase == TaskPhase.DONE && !isExplicitDoneConfirmation(userInput)) {
+            return LifecycleDecision(
+                allowed = false,
+                state = current,
+                message = "Я не могу завершить задачу без явного подтверждения. Сейчас этап VALIDATION: нужно проверить результат или явно сказать, что задача завершена."
+            )
+        }
+
+        val transitioned = newState(
+            taskTitle = current.taskTitle,
+            phase = desiredPhase,
+            currentStep = defaultStep(desiredPhase),
+            expectedAction = defaultExpectedAction(desiredPhase)
+        )
+        store.save(transitioned)
+
+        return LifecycleDecision(
+            allowed = true,
+            state = transitioned,
+            message = "Переход состояния: ${current.phase} -> $desiredPhase."
+        )
+    }
+
     fun updateAfterIteration(userInput: String, assistantResponse: String): TaskState {
         val before = current() ?: start(makeTitle(userInput))
         val proposed = proposeNextState(before, userInput, assistantResponse)
@@ -160,6 +220,23 @@ class TaskStateMachine(
 
     fun clear() {
         store.clear()
+    }
+
+    fun allowedTransitionsDescription(): String {
+        return """
+            EXPLICIT LIFECYCLE TRANSITIONS:
+            - PLANNING -> EXECUTION: only after explicit plan approval.
+            - EXECUTION -> VALIDATION: after implementation/result is produced.
+            - VALIDATION -> DONE: only after explicit completion confirmation.
+            - EXECUTION -> PLANNING: if requirements or plan need revision.
+            - VALIDATION -> EXECUTION: if validation finds changes or fixes.
+            - DONE -> PLANNING: only for a new user request after the previous task is complete.
+            Forbidden:
+            - PLANNING -> VALIDATION
+            - PLANNING -> DONE
+            - EXECUTION -> DONE
+            - Starting a new task before current task is DONE
+        """.trimIndent()
     }
 
     fun promptBlock(): String {
@@ -173,8 +250,7 @@ class TaskStateMachine(
             TASK STATE MACHINE:
             - The assistant manages transitions automatically.
             - User does not manually choose phases.
-            - Allowed forward phases: PLANNING -> EXECUTION -> VALIDATION -> DONE.
-            - Allowed backward transitions: EXECUTION -> PLANNING, VALIDATION -> EXECUTION.
+            ${allowedTransitionsDescription()}
             - A new user request cannot start a new task until the current task is DONE.
             - VALIDATION can become DONE only after explicit user confirmation that the task is complete.
             - Always tell the user what phase you are in.
@@ -206,7 +282,7 @@ class TaskStateMachine(
             Rules:
             - Do not skip phases.
             - If planning is incomplete, stay in PLANNING.
-            - If a clear plan was produced or enough requirements are known, move PLANNING -> EXECUTION.
+            - Do not move PLANNING -> EXECUTION unless the user explicitly approves the plan.
             - If execution produced a concrete result, move EXECUTION -> VALIDATION.
             - Do not move VALIDATION -> DONE unless the user explicitly confirms completion.
             - If the user asks a question, clarification, change, improvement, or correction during VALIDATION, stay in VALIDATION or move back to EXECUTION.
@@ -270,6 +346,15 @@ class TaskStateMachine(
             )
         }
 
+        if (before.phase == TaskPhase.PLANNING && proposed.phase == TaskPhase.EXECUTION && !isPlanApproval(userInput)) {
+            return newState(
+                taskTitle = before.taskTitle,
+                phase = TaskPhase.PLANNING,
+                currentStep = "Дождаться утверждения плана",
+                expectedAction = "Пользователь должен явно утвердить план перед реализацией"
+            )
+        }
+
         if (proposed.phase in allowed) return proposed
 
         return newState(
@@ -317,6 +402,50 @@ class TaskStateMachine(
         return userInput.replace("\n", " ").trim().take(80).ifBlank { "Новая задача" }
     }
 
+    private fun isAllowedTransition(from: TaskPhase, to: TaskPhase): Boolean {
+        return to in when (from) {
+            TaskPhase.PLANNING -> setOf(TaskPhase.PLANNING, TaskPhase.EXECUTION)
+            TaskPhase.EXECUTION -> setOf(TaskPhase.PLANNING, TaskPhase.EXECUTION, TaskPhase.VALIDATION)
+            TaskPhase.VALIDATION -> setOf(TaskPhase.EXECUTION, TaskPhase.VALIDATION, TaskPhase.DONE)
+            TaskPhase.DONE -> setOf(TaskPhase.PLANNING)
+        }
+    }
+
+    private fun inferDesiredPhase(userInput: String): TaskPhase? {
+        val normalized = userInput.lowercase()
+
+        if (isExplicitDoneConfirmation(normalized) || listOf("финал", "заверш").any { normalized.contains(it) }) {
+            return TaskPhase.DONE
+        }
+
+        if (listOf("валид", "проверь", "провер", "review", "тест", "validation").any { normalized.contains(it) }) {
+            return TaskPhase.VALIDATION
+        }
+
+        if (isPlanApproval(normalized) || listOf("реализ", "сделай", "напиши код", "implementation", "execute").any { normalized.contains(it) }) {
+            return TaskPhase.EXECUTION
+        }
+
+        if (listOf("план", "сплан", "требован", "архитект").any { normalized.contains(it) }) {
+            return TaskPhase.PLANNING
+        }
+
+        return null
+    }
+
+    private fun invalidTransitionMessage(from: TaskPhase, to: TaskPhase): String {
+        return when {
+            from == TaskPhase.PLANNING && to == TaskPhase.VALIDATION ->
+                "Я не могу перейти к валидации до реализации. Сейчас этап PLANNING: сначала нужно утвердить план, затем выполнить реализацию."
+            from == TaskPhase.PLANNING && to == TaskPhase.DONE ->
+                "Я не могу завершить задачу из planning. Нужно пройти execution и validation."
+            from == TaskPhase.EXECUTION && to == TaskPhase.DONE ->
+                "Я не могу завершить задачу без validation. Сейчас этап EXECUTION: сначала нужно проверить результат."
+            else ->
+                "Недопустимый переход состояния: $from -> $to. Продолжаю текущий этап $from."
+        }
+    }
+
     private fun isExplicitDoneConfirmation(userInput: String): Boolean {
         val normalized = userInput.lowercase()
         val doneMarkers = listOf(
@@ -331,6 +460,21 @@ class TaskStateMachine(
         )
 
         return doneMarkers.any { marker -> normalized.contains(marker) }
+    }
+
+    private fun isPlanApproval(userInput: String): Boolean {
+        val normalized = userInput.lowercase()
+        val approvalMarkers = listOf(
+            "план утвержден",
+            "утверждаю план",
+            "план ок",
+            "план согласован",
+            "согласен с планом",
+            "approve plan",
+            "plan approved"
+        )
+
+        return approvalMarkers.any { marker -> normalized.contains(marker) }
     }
 }
 

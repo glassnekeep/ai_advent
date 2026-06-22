@@ -1,7 +1,7 @@
 package org.example
 
-import org.example.task14.task14
+import org.example.task15.task15
 
 fun main() {
-    task14()
+    task15()
 }
