@@ -6,6 +6,7 @@ import org.example.utils.DEFAULT_MODEL
 import org.example.utils.Usage
 import org.example.utils.fetchResponseWithUsage
 import java.io.File
+import java.util.Locale
 
 enum class MemoryLayer {
     SHORT_TERM,
@@ -59,6 +60,8 @@ class MarkdownMemoryStore(private val directoryPath: String = "assistant_memory"
             .joinToString("\n") { "- ${it.path}" }
     }
 
+    fun directoryPath(): String = directory.path
+
     private fun ensureFile(file: File, title: String) {
         if (!file.exists()) {
             file.writeText(emptyMarkdown(title))
@@ -76,18 +79,32 @@ class MarkdownMemoryStore(private val directoryPath: String = "assistant_memory"
     }
 }
 
+fun userMemoryStore(userName: String, rootDirectory: String = "assistant_memory/users"): MarkdownMemoryStore {
+    return MarkdownMemoryStore("$rootDirectory/${safeUserId(userName)}")
+}
+
+fun safeUserId(userName: String): String {
+    return userName.trim()
+        .lowercase(Locale.getDefault())
+        .replace(Regex("[^a-zа-я0-9._-]+"), "_")
+        .trim('_')
+        .ifBlank { "default" }
+}
+
 class MemoryLayeredAgent(
     private val model: String = DEFAULT_MODEL,
     private val baseSystemPrompt: String = "Ты — полезный ИИ-помощник.",
     private val store: MarkdownMemoryStore = MarkdownMemoryStore(),
-    private val sessionContext: String = ""
+    private val sessionContext: String = "",
+    private val sessionContextProvider: () -> String = { sessionContext }
 ) {
     private var memory = store.load()
     private var totalPromptTokens = 0
     private var totalCompletionTokens = 0
     private var totalMemoryOverheadTokens = 0
 
-    fun ask(userInput: String) {
+    fun ask(userInput: String): String? {
+        memory = store.load()
         memory = memory.copy(shortTerm = appendTurn(memory.shortTerm, "Пользователь", userInput))
         store.save(memory)
 
@@ -113,7 +130,10 @@ class MemoryLayeredAgent(
             println("\nАгент: $content")
             updateMemoryLayers(userInput, content)
             printStats(usage)
+            return content
         }
+
+        return null
     }
 
     fun clear(layer: MemoryLayer) {
@@ -134,7 +154,12 @@ class MemoryLayeredAgent(
 
         val updatedWorking = updateWorkingMemoryFromSession()
         if (updatedWorking != null) {
-            memory = memory.copy(working = updatedWorking)
+            memory = memory.copy(
+                working = preserveTaskStateBlock(
+                    previousWorking = memory.working,
+                    updatedWorking = updatedWorking
+                )
+            )
             store.save(memory)
             println("[Session] Working memory обновлена.")
         } else {
@@ -170,9 +195,10 @@ class MemoryLayeredAgent(
     private fun buildMessages(userInput: String): List<ChatMessage> {
         val systemPrompt = buildString {
             append(baseSystemPrompt)
-            if (sessionContext.isNotBlank()) {
+            val currentSessionContext = sessionContextProvider().trim()
+            if (currentSessionContext.isNotBlank()) {
                 append("\n\nSESSION CONTEXT:\n")
-                append(sessionContext)
+                append(currentSessionContext)
             }
             append("\n\nУ тебя есть явная модель памяти. Используй слои строго по назначению:")
             append("\n- short-term: текущий диалог.")
@@ -207,6 +233,7 @@ class MemoryLayeredAgent(
 
             Явно выбирай слой:
             - сохраняй существующие разделы "## User Profile: ..." в long-term memory, если пользователь прямо не попросил удалить или изменить профиль;
+            - сохраняй служебный блок "<!-- TASK_STATE_START --> ... <!-- TASK_STATE_END -->" в working memory без удаления, если он там есть;
             - не клади временные детали задачи в long-term;
             - не клади профиль пользователя в working, если это устойчивое предпочтение;
             - удаляй устаревшее, объединяй дубли, оставляй только факты;
@@ -266,7 +293,12 @@ class MemoryLayeredAgent(
             return
         }
 
-        memory = updated
+        memory = updated.copy(
+            working = preserveTaskStateBlock(
+                previousWorking = memory.working,
+                updatedWorking = updated.working
+            )
+        )
         store.save(memory)
         println("[Memory] Слои обновлены.")
     }
@@ -280,6 +312,7 @@ class MemoryLayeredAgent(
             - сохрани незавершенные задачи, решения, ограничения, важные вводные и следующие шаги;
             - не копируй весь диалог;
             - не добавляй профиль пользователя и долговременные предпочтения;
+            - сохрани служебный блок "<!-- TASK_STATE_START --> ... <!-- TASK_STATE_END -->" в working memory без удаления, если он там есть;
             - не добавляй светскую беседу и временные фразы;
             - объедини дубли и удали устаревшее;
             - если полезного рабочего контекста нет, верни текущую working memory без изменений;
@@ -349,6 +382,28 @@ class MemoryLayeredAgent(
             .count { it.trimStart().startsWith("- ") && !it.contains("Пока нет данных") }
     }
 
+    private fun preserveTaskStateBlock(previousWorking: String, updatedWorking: String): String {
+        val previousBlock = extractTaskStateBlock(previousWorking) ?: return updatedWorking
+        if (extractTaskStateBlock(updatedWorking) != null) return updatedWorking
+
+        val cleaned = updatedWorking.trimEnd()
+        return buildString {
+            if (cleaned.isNotBlank()) {
+                append(cleaned)
+                append("\n\n")
+            }
+            append(previousBlock)
+            append("\n")
+        }
+    }
+
+    private fun extractTaskStateBlock(markdown: String): String? {
+        val start = markdown.indexOf(TASK_STATE_START)
+        val end = markdown.indexOf(TASK_STATE_END)
+        if (start < 0 || end < 0 || end <= start) return null
+        return markdown.substring(start, end + TASK_STATE_END.length).trim()
+    }
+
     private fun printStats(currentUsage: Usage?) {
         println("\n--- Статистика памяти и токенов ---")
         println("Слои памяти: ${statusLine()}")
@@ -360,5 +415,10 @@ class MemoryLayeredAgent(
         println("Completion всего: $totalCompletionTokens")
         println("Overhead обновления памяти: $totalMemoryOverheadTokens")
         println("--------------------------")
+    }
+
+    private companion object {
+        const val TASK_STATE_START = "<!-- TASK_STATE_START -->"
+        const val TASK_STATE_END = "<!-- TASK_STATE_END -->"
     }
 }
